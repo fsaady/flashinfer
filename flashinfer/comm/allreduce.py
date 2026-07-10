@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import socket
 
 logger = logging.getLogger(__name__)
 
@@ -56,31 +57,43 @@ from typing import Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
 
 from .trtllm_ar import trtllm_allreduce_fusion
+from .trtllm_ar import trtllm_create_p2p_workspace_for_all_reduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
+from .trtllm_ar import trtllm_destroy_p2p_workspace_for_all_reduce_fusion
 from .trtllm_ar import trtllm_moe_allreduce_fusion
 from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import CommBackend, SymmDeviceMemory, is_cuda_multicast_supported
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
 from .trtllm_ar import AllReduceFusionPattern
+from .trtllm_ar import AllReduceStrategyConfig
+from .trtllm_ar import MAX_COMM_SIZE
 from .trtllm_ar import QuantizationSFLayout
+from .trtllm_ar import _should_use_oneshot as _should_use_trtllm_oneshot
 from .trtllm_mnnvl_ar import MNNVLAllReduceFusionWorkspace
 from .trtllm_mnnvl_ar import MNNVLAllreduceFusionStrategy
 from .trtllm_mnnvl_ar import MNNVLQuantType
 from .trtllm_mnnvl_ar import trtllm_mnnvl_allreduce
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
+
+_TRTLLM_P2P_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_TRTLLM_P2P_SUPPORTED_PATTERNS = (
+    AllReduceFusionPattern.kAllReduce,
+    AllReduceFusionPattern.kARResidualRMSNorm,
+)
 
 # ============================================================================
 # WORKSPACE IMPLEMENTATIONS
@@ -110,6 +123,8 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         dtype: torch.dtype = torch.float16,
         comm_backend: Optional[CommBackend] = None,
         group: Optional[ProcessGroup] = None,
+        use_p2p: bool = False,
+        p2p_config_code: int = AllReduceStrategyConfig.PUSH_MODE,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -122,8 +137,26 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             dtype: Data type
             comm_backend: Communication backend
             group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
+            use_p2p: Use CUDA IPC/P2P buffers instead of symmetric memory.
         """
         super().__init__(tp_size, tp_rank)
+        self._use_p2p = use_p2p
+        self._p2p_workspace: Optional[_TRTLLMP2PAllReduceFusionWorkspace] = None
+        self._destroyed = False
+
+        if use_p2p:
+            self._p2p_workspace = _TRTLLMP2PAllReduceFusionWorkspace(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                max_token_num=max_token_num,
+                hidden_dim=hidden_dim,
+                dtype=dtype,
+                group=group,
+                config_code=p2p_config_code,
+            )
+            self.ipc_handles = self._p2p_workspace.ipc_handles
+            self.metadata = self._p2p_workspace.metadata
+            return
 
         # Call the actual workspace creation function
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
@@ -159,6 +192,10 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise AttributeError(
                 f"'{type(self).__name__}' object has no attribute '{name}'"
             )
+        if getattr(self, "_use_p2p", False):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
         return getattr(self._internal_workspace, name)
 
     def is_buffer_size_sufficient(
@@ -183,12 +220,95 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
+        if getattr(self, "_use_p2p", False):
+            if self._p2p_workspace is not None:
+                self._p2p_workspace.destroy()
+            del self.ipc_handles
+            del self.metadata
+            self._destroyed = True
+            return
+
         del self.ipc_handles
         del self.workspace_tensor
         del self.mem_handles
         del self.metadata
         self._destroyed = True
 
+
+class _TRTLLMP2PAllReduceFusionWorkspace(AllReduceFusionWorkspace):
+    """Internal TensorRT-LLM custom allreduce workspace using CUDA IPC/P2P."""
+
+    def __init__(
+        self,
+        tp_size: int,
+        tp_rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype = torch.float16,
+        group: Optional[ProcessGroup] = None,
+        config_code: int = AllReduceStrategyConfig.PUSH_MODE,
+    ):
+        if dtype not in _TRTLLM_P2P_SUPPORTED_DTYPES:
+            raise ValueError(f"TRT-LLM P2P fallback does not support dtype {dtype}")
+        super().__init__(tp_size, tp_rank)
+        (
+            self.ipc_handles,
+            self.workspace_tensor,
+            self._flag_ptr,
+            self.metadata,
+        ) = trtllm_create_p2p_workspace_for_all_reduce_fusion(
+            rank=tp_rank,
+            tp_size=tp_size,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            group=group,
+        )
+        self.group = group
+        self.config_code = config_code
+        self._destroyed = False
+        logger.info(
+            "FlashInfer TRT-LLM P2P allreduce workspace initialized: "
+            "rank=%s, world_size=%s, max_token_num=%s, hidden_dim=%s, config_code=%s",
+            tp_rank,
+            tp_size,
+            max_token_num,
+            hidden_dim,
+            config_code,
+        )
+
+    @property
+    def backend(self) -> str:
+        return "trtllm"
+
+    def is_buffer_size_sufficient(
+        self,
+        tp_size: int,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[Any] = None,
+    ) -> bool:
+        try:
+            check_trtllm_allreduce_fusion_workspace_metadata(
+                num_tokens, hidden_dim, tp_size, dtype, self.metadata
+            )
+            return True
+        except ValueError as e:
+            logger.warning("TRT-LLM P2P workspace is insufficient. %s", e)
+            return False
+
+    def destroy(self) -> None:
+        if getattr(self, "_destroyed", False):
+            return
+        trtllm_destroy_p2p_workspace_for_all_reduce_fusion(
+            self.ipc_handles, self._flag_ptr, group=self.group
+        )
+        del self.workspace_tensor
+        del self._flag_ptr
+        del self.ipc_handles
+        del self.metadata
+        self._destroyed = True
 
 # ============================================================================
 # BACKEND CHECKS - Hard requirements for backend selection
@@ -202,14 +322,296 @@ def _trtllm_workspace_check(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    group: Optional[ProcessGroup] = None,
 ) -> bool:
     """
     Check if trtllm backend CAN be used for workspace creation.
 
     Hard requirements:
     - Up to 16 ranks supported.
+    - CUDA multicast for the symmetric-memory path, or the CUDA IPC/P2P fallback
+      requirements when multicast is unavailable.
     """
-    return world_size <= 16
+    if world_size > 16:
+        return False
+    if is_cuda_multicast_supported():
+        return True
+    return _trtllm_p2p_workspace_check(
+        backend=backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        group=group,
+    )
+
+
+def _trtllm_p2p_workspace_check(
+    backend: str,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    group: Optional[ProcessGroup] = None,
+) -> bool:
+    """
+    Check if the experimental CUDA IPC/P2P TRTLLM backend can be attempted.
+
+    This path intentionally avoids multicast and symmetric device memory, but
+    CUDA IPC still requires peer access between all participating rank devices.
+    """
+    return (
+        world_size <= 16
+        and dtype in _TRTLLM_P2P_SUPPORTED_DTYPES
+        and _all_ranks_on_same_node(group)
+        and _all_ranks_have_cuda_peer_access(world_size, group)
+    )
+
+
+def _all_ranks_on_same_node(group: Optional[ProcessGroup] = None) -> bool:
+    """Return whether all ranks in the process group run on the same host."""
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return True
+
+    try:
+        if group is None:
+            group = dist.group.WORLD
+        hostnames: List[str] = [""] * dist.get_world_size(group=group)
+        dist.all_gather_object(hostnames, socket.gethostname(), group=group)
+        return len(set(hostnames)) == 1
+    except Exception as e:
+        logger.warning(
+            "Could not verify single-node placement for TRT-LLM P2P fallback. %s",
+            e,
+        )
+        return False
+
+
+def _all_ranks_have_cuda_peer_access(
+    world_size: int,
+    group: Optional[ProcessGroup] = None,
+) -> bool:
+    """Return whether every participating rank device can access every peer."""
+
+    if world_size <= 1:
+        return True
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        if dist.is_available() and dist.is_initialized():
+            if group is None:
+                group = dist.group.WORLD
+            rank_devices: List[int] = [0] * dist.get_world_size(group=group)
+            dist.all_gather_object(
+                rank_devices, torch.cuda.current_device(), group=group
+            )
+            # If each process has a private CUDA_VISIBLE_DEVICES mapping, every
+            # rank often reports device 0. In that case the ordinals are not
+            # comparable within this process, so peer access cannot be verified.
+            # Keep the P2P fallback disabled for that launch style for now;
+            # callers can still fall back to the standard unfused/NCCL path.
+            if len(set(rank_devices)) != len(rank_devices):
+                return False
+        else:
+            if torch.cuda.device_count() < world_size:
+                return False
+            rank_devices = list(range(world_size))
+
+        if torch.cuda.device_count() <= max(rank_devices):
+            return False
+
+        local_supported = True
+        for src_device in rank_devices:
+            for dst_device in rank_devices:
+                if src_device == dst_device:
+                    continue
+                if not torch.cuda.can_device_access_peer(src_device, dst_device):
+                    local_supported = False
+                    break
+            if not local_supported:
+                break
+
+        if dist.is_available() and dist.is_initialized():
+            local_results: List[bool] = [False] * dist.get_world_size(group=group)
+            dist.all_gather_object(local_results, local_supported, group=group)
+            return all(local_results)
+
+        return local_supported
+    except Exception as e:
+        logger.warning(
+            "Could not verify CUDA peer access for TRT-LLM P2P fallback. %s",
+            e,
+        )
+        return False
+
+
+def _flatten_contiguous_tensor(
+    tensor: Optional[torch.Tensor],
+    name: str,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return tensor.view(-1)
+
+
+def _check_matching_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    reference: torch.Tensor,
+) -> None:
+    if tensor.shape != reference.shape:
+        raise ValueError(
+            f"{name} must have shape {tuple(reference.shape)}, got {tuple(tensor.shape)}"
+        )
+    if tensor.dtype != reference.dtype:
+        raise ValueError(
+            f"{name} must have dtype {reference.dtype}, got {tensor.dtype}"
+        )
+
+
+def _select_trtllm_p2p_use_oneshot(
+    use_oneshot: Optional[bool],
+    token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    world_size: int,
+) -> int:
+    if use_oneshot is None:
+        try:
+            use_oneshot = _should_use_trtllm_oneshot(
+                token_num, hidden_dim, dtype, world_size
+            )
+        except KeyError:
+            # The inherited TRT-LLM heuristic is calibrated for 2/4/8 ranks.
+            # Keep other P2P world sizes conservative.
+            use_oneshot = False
+    else:
+        use_oneshot = bool(use_oneshot)
+
+    required_lamport_comm_size = (
+        token_num * hidden_dim * 2 * world_size
+        if dtype != torch.float32
+        else token_num * hidden_dim * 4 * world_size
+    )
+    if required_lamport_comm_size > MAX_COMM_SIZE and use_oneshot:
+        logger.warning(
+            "required_lamport_comm_size %s is greater than MAX_COMM_SIZE %s. "
+            "Cannot use oneshot in this case.",
+            required_lamport_comm_size,
+            MAX_COMM_SIZE,
+        )
+        use_oneshot = False
+    if not use_oneshot and token_num <= world_size:
+        raise ValueError(
+            "TRT-LLM P2P fallback twoshot requires token_num > world_size; "
+            f"got token_num={token_num}, world_size={world_size}."
+        )
+    return use_oneshot
+
+
+def _dispatch_trtllm_p2p_allreduce_fusion(
+    input: torch.Tensor,
+    workspace: _TRTLLMP2PAllReduceFusionWorkspace,
+    pattern: int,
+    launch_with_pdl: bool,
+    output: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    residual_in: Optional[torch.Tensor],
+    rms_gamma: Optional[torch.Tensor],
+    rms_eps: float,
+    use_oneshot: Optional[bool],
+    trigger_completion_at_end: bool,
+    fp32_acc: bool,
+    weight_bias: float,
+) -> torch.Tensor:
+    if pattern not in _TRTLLM_P2P_SUPPORTED_PATTERNS:
+        raise ValueError(
+            "TRT-LLM P2P fallback currently supports only kAllReduce and "
+            "kARResidualRMSNorm. Quantized and MoE variants are not implemented "
+            "for the CUDA IPC/P2P workspace."
+        )
+
+    if input.ndim != 2:
+        raise ValueError(f"input must be 2-D, got shape {tuple(input.shape)}")
+    if input.dtype not in _TRTLLM_P2P_SUPPORTED_DTYPES:
+        raise ValueError(f"TRT-LLM P2P fallback does not support dtype {input.dtype}")
+
+    token_num, hidden_dim = input.shape
+    if not workspace.is_buffer_size_sufficient(
+        workspace.world_size, token_num, hidden_dim, input.dtype
+    ):
+        raise ValueError(
+            "TRT-LLM P2P fallback workspace is too small for "
+            f"token_num={token_num}, hidden_dim={hidden_dim}, dtype={input.dtype}"
+        )
+
+    if pattern == AllReduceFusionPattern.kAllReduce:
+        if output is None:
+            output = torch.empty_like(input)
+        else:
+            _check_matching_tensor(output, "output", input)
+        result = output
+    else:
+        if residual_in is None:
+            raise ValueError("TRT-LLM P2P fallback RMSNorm fusion requires residual_in")
+        if rms_gamma is None:
+            raise ValueError("TRT-LLM P2P fallback RMSNorm fusion requires rms_gamma")
+        _check_matching_tensor(residual_in, "residual_in", input)
+        if rms_gamma.shape != (hidden_dim,):
+            raise ValueError(
+                f"rms_gamma must have shape ({hidden_dim},), got {tuple(rms_gamma.shape)}"
+            )
+        if norm_out is None:
+            norm_out = torch.empty_like(input)
+        else:
+            _check_matching_tensor(norm_out, "norm_out", input)
+        if residual_out is None:
+            residual_out = torch.empty_like(input)
+        else:
+            _check_matching_tensor(residual_out, "residual_out", input)
+        output = norm_out
+        result = norm_out
+
+    use_oneshot = _select_trtllm_p2p_use_oneshot(
+        use_oneshot, token_num, hidden_dim, input.dtype, workspace.world_size
+    )
+
+    trtllm_allreduce_fusion(
+        allreduce_in=_flatten_contiguous_tensor(input, "input"),
+        world_size=workspace.world_size,
+        world_rank=workspace.rank,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=workspace.workspace_tensor,
+        launch_with_pdl=launch_with_pdl,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        pattern_code=cast(Any, pattern),
+        use_oneshot=use_oneshot,
+        allreduce_out=_flatten_contiguous_tensor(output, "output")
+        if pattern == AllReduceFusionPattern.kAllReduce
+        else None,
+        residual_in=_flatten_contiguous_tensor(residual_in, "residual_in"),
+        residual_out=_flatten_contiguous_tensor(residual_out, "residual_out"),
+        norm_out=_flatten_contiguous_tensor(norm_out, "norm_out"),
+        quant_out=None,
+        scale_out=None,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        scale_factor=None,
+        layout_code=None,
+        metadata=workspace.metadata,
+        weight_bias=weight_bias,
+    )
+
+    return result
 
 
 def _mnnvl_workspace_check(
@@ -225,7 +627,7 @@ def _mnnvl_workspace_check(
 
     """
 
-    return True
+    return is_cuda_multicast_supported()
 
 
 # ============================================================================
@@ -277,8 +679,7 @@ def _workspace_creation_heuristic(
     # patterns and packed group FP8 quantization.
     if "mnnvl" in suitable_backends:
         return ["mnnvl"]
-    else:
-        return [suitable_backends[0]]
+    return [suitable_backends[0]]
 
 
 # ============================================================================
@@ -315,7 +716,11 @@ def create_allreduce_fusion_workspace(
     ----------
     backend : Literal["trtllm", "mnnvl", "auto"]
         Backend to use. ``"auto"`` uses a topology-based heuristic to pick
-        between ``"trtllm"`` and ``"mnnvl"``.
+        ``"mnnvl"`` when CUDA multicast is supported. Otherwise, ``"trtllm"``
+        can use an internal CUDA IPC/P2P fallback for supported all-reduce and
+        all-reduce+RMSNorm calls when the process group is single-node, all
+        participating rank devices have CUDA peer access, and
+        the requested dtype is supported.
     world_size : int
         Number of ranks in the process group.
     rank : int
@@ -347,8 +752,8 @@ def create_allreduce_fusion_workspace(
     -------
     AllReduceFusionWorkspace
         Either a ``TRTLLMAllReduceFusionWorkspace`` or
-        ``MNNVLAllReduceFusionWorkspace``. The workspace type determines
-        which backend :func:`allreduce_fusion` will dispatch to.
+        ``MNNVLAllReduceFusionWorkspace``. The workspace type determines which
+        backend :func:`allreduce_fusion` will dispatch to.
 
     Raises
     ------
@@ -397,6 +802,7 @@ def create_allreduce_fusion_workspace(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
+            group=group,
         ):
             suitable_backends.append("trtllm")
         if _mnnvl_workspace_check(
@@ -408,7 +814,6 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
         ):
             suitable_backends.append("mnnvl")
-
         if not suitable_backends:
             raise ValueError("No suitable backend found. ")
 
@@ -428,6 +833,21 @@ def create_allreduce_fusion_workspace(
 
     # Create workspace for selected backend using workspace constructors
     if actual_backend == "trtllm":
+        if not _trtllm_workspace_check(
+            backend=actual_backend,
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            group=group,
+        ):
+            raise ValueError(
+                "trtllm allreduce fusion supports <=16 ranks with CUDA "
+                "multicast, or float16/bfloat16/float32 tensors with "
+                "a single-node process group with CUDA peer access when "
+                "multicast is unavailable."
+            )
         return TRTLLMAllReduceFusionWorkspace(
             tp_size=world_size,
             tp_rank=rank,
@@ -436,6 +856,7 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
             comm_backend=comm_backend,
             group=group,
+            use_p2p=not is_cuda_multicast_supported(),
         )
 
     elif actual_backend == "mnnvl":
@@ -675,6 +1096,25 @@ def allreduce_fusion(
     """
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
+        if getattr(workspace, "_use_p2p", False):
+            assert workspace._p2p_workspace is not None
+            return _dispatch_trtllm_p2p_allreduce_fusion(
+                input=input,
+                workspace=workspace._p2p_workspace,
+                pattern=pattern,
+                launch_with_pdl=launch_with_pdl,
+                output=output,
+                residual_out=residual_out,
+                norm_out=norm_out,
+                residual_in=residual_in,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                use_oneshot=use_oneshot,
+                trigger_completion_at_end=trigger_completion_at_end,
+                fp32_acc=fp32_acc,
+                weight_bias=weight_bias,
+            )
+
         # TensorRT-LLM backend implementation
 
         # ---- MOE Reduction pattern ----
@@ -1102,5 +1542,6 @@ def allreduce_fusion(
     else:
         raise TypeError(
             f"Unknown workspace type: {type(workspace)}. "
-            f"Expected TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace"
+            "Expected TRTLLMAllReduceFusionWorkspace, "
+            "or MNNVLAllReduceFusionWorkspace"
         )

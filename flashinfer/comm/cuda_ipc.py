@@ -15,7 +15,9 @@ limitations under the License.
 """
 
 import ctypes
+import ctypes.util
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, Dict, List, Optional
 
 import torch.distributed as dist
@@ -40,31 +42,64 @@ class Function:
     argtypes: List[Any]
 
 
-def find_loaded_library(lib_name) -> Optional[str]:
+def _mapped_library_path(line: str) -> Optional[str]:
+    fields = line.strip().split(maxsplit=5)
+    if len(fields) < 6:
+        return None
+    path = fields[5].removesuffix(" (deleted)")
+    return path if path.startswith("/") else None
+
+
+def _shared_library_matches(path: str, lib_name: str) -> bool:
+    filename = PurePath(path).name
+    versioned_name = f"{lib_name}.so"
+    return (
+        filename == versioned_name
+        or filename.startswith(f"{versioned_name}.")
+        or (filename.startswith(f"{lib_name}-") and ".so" in filename)
+    )
+
+
+def _is_cuda_stub_library(path: str) -> bool:
+    return any(part.lower() == "stubs" for part in PurePath(path).parts)
+
+
+def _loader_library_name(lib_name: str) -> str:
+    if lib_name.startswith("lib"):
+        lib_name = lib_name[3:]
+    return lib_name.split(".so", maxsplit=1)[0]
+
+
+def _find_loaded_library_from_maps(lib_name: str, maps_path: str) -> Optional[str]:
+    with open(maps_path) as f:
+        for line in f:
+            path = _mapped_library_path(line)
+            if path is None or not _shared_library_matches(path, lib_name):
+                continue
+            if lib_name == "libcudart" and _is_cuda_stub_library(path):
+                continue
+            return path
+    return None
+
+
+def find_loaded_library(lib_name: str) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
     the file `/proc/self/maps` contains the memory maps of the process, which includes the
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
-    with open("/proc/self/maps") as f:
-        for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
-        # the library is not loaded in the current process
-        return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(lib_name), (
-        f"Unexpected filename: {filename} for library {lib_name}"
-    )
-    return path
+    mapped_path = _find_loaded_library_from_maps(lib_name, "/proc/self/maps")
+    if mapped_path is not None:
+        return mapped_path
+
+    loader_name = ctypes.util.find_library(_loader_library_name(lib_name))
+    if loader_name is not None:
+        return loader_name
+
+    # The library is not loaded in the current process, or only a CUDA stub
+    # was mapped. Returning None lets callers fail with a clear error.
+    return None
 
 
 class CudaRTLibrary:
@@ -109,6 +144,8 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        # ​cudaError_t cudaIpcCloseMemHandle ( void* devPtr )
+        Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -122,7 +159,7 @@ class CudaRTLibrary:
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
             so_file = find_loaded_library("libcudart")
-            assert so_file is not None, "libcudart is not loaded in the current process"
+            assert so_file is not None, "libcudart could not be found"
         if so_file not in CudaRTLibrary.path_to_library_cache:
             lib = ctypes.CDLL(so_file)
             CudaRTLibrary.path_to_library_cache[so_file] = lib
@@ -190,6 +227,9 @@ class CudaRTLibrary:
         )
         return devPtr
 
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))
+
 
 class _LazyCudaRTLibrary:
     _library: Optional[CudaRTLibrary] = None
@@ -204,6 +244,15 @@ class _LazyCudaRTLibrary:
 
 
 cudart = _LazyCudaRTLibrary()
+
+
+def _get_group_local_rank(group: ProcessGroup) -> int:
+    """Return this process' rank within ``group`` rather than its global rank."""
+
+    global_rank = dist.get_rank()
+    if hasattr(dist, "get_group_rank"):
+        return dist.get_group_rank(group, global_rank)
+    return dist.get_process_group_ranks(group).index(global_rank)
 
 
 def create_shared_buffer(
@@ -234,9 +283,7 @@ def create_shared_buffer(
     if group is None:
         group = dist.group.WORLD
     world_size = dist.get_world_size(group=group)
-    rank = dist.get_rank(group=group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=group)
+    rank = _get_group_local_rank(group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
 
@@ -269,7 +316,12 @@ def free_shared_buffer(
     """
     if group is None:
         group = dist.group.WORLD
-    rank = dist.get_rank(group=group)
+    rank = _get_group_local_rank(group)
+    dist.barrier(group=group)
+    for i, pointer in enumerate(pointers):
+        if pointer is not None and i != rank:
+            cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
+    dist.barrier(group=group)
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)

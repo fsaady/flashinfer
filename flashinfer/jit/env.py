@@ -54,6 +54,14 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
 
 FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
+_source_root: pathlib.Path = _package_root.parent
+
+
+def _package_data_or_source_dir(data_subdir: str, source_subdir: str) -> pathlib.Path:
+    packaged_dir = _package_root / "data" / data_subdir
+    if packaged_dir.exists():
+        return packaged_dir
+    return _source_root / source_subdir
 
 
 def _get_cubin_dir():
@@ -149,16 +157,21 @@ FLASHINFER_WORKSPACE_DIR: pathlib.Path = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
 FLASHINFER_DATA: pathlib.Path = _package_root / "data"
-FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
+FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_data_or_source_dir("include", "include")
+FLASHINFER_CSRC_DIR: pathlib.Path = _package_data_or_source_dir("csrc", "csrc")
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
-    _package_root / "data" / "cutlass" / "include",
-    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
+    _package_data_or_source_dir("cutlass", "3rdparty/cutlass") / "include",
+    _package_data_or_source_dir("cutlass", "3rdparty/cutlass")
+    / "tools"
+    / "util"
+    / "include",
 ]
-SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
+SPDLOG_INCLUDE_DIR: pathlib.Path = (
+    _package_data_or_source_dir("spdlog", "3rdparty/spdlog") / "include"
+)
 CCCL_INCLUDE_DIRS: list[pathlib.Path] = [
-    _package_root / "data" / "cccl" / "cub",
-    _package_root / "data" / "cccl" / "libcudacxx" / "include",
-    _package_root / "data" / "cccl" / "thrust",
+    _package_data_or_source_dir("cccl", "3rdparty/cccl") / "cub",
+    _package_data_or_source_dir("cccl", "3rdparty/cccl") / "libcudacxx" / "include",
+    _package_data_or_source_dir("cccl", "3rdparty/cccl") / "thrust",
 ]

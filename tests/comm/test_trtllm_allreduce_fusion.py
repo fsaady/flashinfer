@@ -22,6 +22,10 @@ SF_VEC_SIZE = 16
 
 # temp var
 SCALE_FACTOR_RANGE = (-1, 1)
+P2P_SUPPORTED_PATTERNS = {
+    comm.AllReduceFusionPattern.kAllReduce,
+    comm.AllReduceFusionPattern.kARResidualRMSNorm,
+}
 
 
 def _run_correctness_worker(
@@ -93,6 +97,11 @@ def _run_correctness_worker(
                 dtype=dtype,
                 comm_backend=TorchDistBackend(),
             )
+        use_p2p_workspace = (
+            not legacy_api
+            and workspace is not None
+            and getattr(workspace, "_use_p2p", False)
+        )
 
         test_loop = 5
 
@@ -104,6 +113,11 @@ def _run_correctness_worker(
                             for trigger_completion_at_end in trigger_completion_at_ends:
                                 for fp32_acc in fp32_accs:
                                     if token_num < world_size and not use_oneshot:
+                                        continue
+                                    if (
+                                        use_p2p_workspace
+                                        and pattern_code not in P2P_SUPPORTED_PATTERNS
+                                    ):
                                         continue
                                     if dtype == torch.float32 and (
                                         pattern_code

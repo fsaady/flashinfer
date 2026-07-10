@@ -30,7 +30,7 @@ from ..jit.comm import gen_trtllm_comm_module
 from ..utils import register_custom_op, round_up
 
 logger = logging.getLogger(__name__)
-from .cuda_ipc import cudart
+from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
@@ -430,8 +430,49 @@ def get_trtllm_comm_module():
 OneShotMaxToken = 128
 MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
+_ALLREDUCE_COMM_BUFFER_DTYPE = torch.float32
+_ALLREDUCE_FLAG_DTYPE = torch.int32
+_ALLREDUCE_LAMPORT_BUFFER_DTYPE = torch.float16
 
 _symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
+_p2p_workspace_refs: dict[int, list[List[int]]] = {}
+_p2p_fusion_workspace_refs: dict[int, list[List[int]]] = {}
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _trtllm_custom_allreduce_workspace_sizes(
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    use_fp32_lamport: bool = False,
+) -> dict[str, int]:
+    lamport_dtype = (
+        torch.float32 if use_fp32_lamport else _ALLREDUCE_LAMPORT_BUFFER_DTYPE
+    )
+    buffer_size = (
+        tp_size
+        * max_token_num
+        * hidden_dim
+        * _dtype_nbytes(_ALLREDUCE_COMM_BUFFER_DTYPE)
+    )
+    flag_size = (
+        (MAX_ALL_REDUCE_BLOCKS + 1) * _dtype_nbytes(_ALLREDUCE_FLAG_DTYPE) * tp_size * 2
+    )
+    lamport_buffer_size = (
+        tp_size
+        * LamportTokenNumThreshold
+        * tp_size
+        * hidden_dim
+        * _dtype_nbytes(lamport_dtype)
+    )
+    return {
+        "buffer_size": buffer_size,
+        "flag_size": flag_size,
+        "lamport_buffer_size": lamport_buffer_size,
+    }
 
 
 @deprecated(
@@ -480,10 +521,12 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     Reference: trtllm, cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
     """
 
-    buffer_size = tp_size * max_token_num * hidden_dim * 4
-    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4
-    flag_size = FLAG_SIZE * tp_size * 2
-    lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
+    workspace_sizes = _trtllm_custom_allreduce_workspace_sizes(
+        tp_size, max_token_num, hidden_dim
+    )
+    buffer_size = workspace_sizes["buffer_size"]
+    flag_size = workspace_sizes["flag_size"]
+    lamport_buffer_size = workspace_sizes["lamport_buffer_size"]
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     group_name = (
@@ -548,6 +591,192 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
         group: Unused, kept for API compatibility.
     """
     _symm_workspace_refs.pop(id(workspace), None)
+
+
+def trtllm_create_p2p_workspace_for_all_reduce(
+    rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim,
+    dtype: torch.dtype = torch.float16,
+    group: Optional[ProcessGroup] = None,
+) -> Tuple[List[List[int]], dict]:
+    """
+    Create a peer-buffer workspace for trtllm_custom_all_reduce using CUDA IPC.
+
+    This is an experimental CUDA IPC/P2P path for platforms where CUDA multicast
+    and symmetric device memory are unavailable. The returned pointer layout is
+    the legacy TRTLLM custom-allreduce layout:
+
+    [comm_ping, comm_pong, barrier_in, barrier_out, lamport_0, lamport_1, lamport_2]
+    """
+
+    use_fp32_lamport = dtype == torch.float32
+    lamport_dtype = torch.float32 if use_fp32_lamport else torch.float16
+    lamport_element_size = _dtype_nbytes(lamport_dtype)
+    workspace_sizes = _trtllm_custom_allreduce_workspace_sizes(
+        tp_size, max_token_num, hidden_dim, use_fp32_lamport=use_fp32_lamport
+    )
+    buffer_size = workspace_sizes["buffer_size"]
+    flag_size = workspace_sizes["flag_size"]
+    lamport_buffer_size = workspace_sizes["lamport_buffer_size"]
+
+    ipc_handles: List[List[int]] = []
+    try:
+        for size in [
+            buffer_size,
+            buffer_size,
+            flag_size,
+            flag_size,
+            lamport_buffer_size,
+            lamport_buffer_size,
+            lamport_buffer_size,
+        ]:
+            ipc_handles.append(create_shared_buffer(round_up(size, 16), group=group))
+    except Exception:
+        for ptrs in ipc_handles:
+            free_shared_buffer(ptrs, group=group)
+        raise
+
+    _p2p_workspace_refs[id(ipc_handles)] = ipc_handles
+
+    trtllm_lamport_initialize_all(
+        ipc_handles[4][rank],
+        ipc_handles[5][rank],
+        ipc_handles[6][rank],
+        round_up(lamport_buffer_size, 16) // lamport_element_size,
+        lamport_dtype,
+    )
+
+    dist.barrier(group=group)
+
+    metadata = {
+        "tp_rank": rank,
+        "tp_size": tp_size,
+        "max_token_num": max_token_num,
+        "hidden_dim": hidden_dim,
+        "use_fp32_lamport": use_fp32_lamport,
+        "buffer_size": buffer_size,
+        "flag_size": flag_size,
+        "lamport_buffer_size": lamport_buffer_size,
+        "workspace_kind": "trtllm_p2p_fallback",
+    }
+    return ipc_handles, metadata
+
+
+def trtllm_destroy_p2p_workspace_for_all_reduce(
+    workspace: List[List[int]], group: Optional[ProcessGroup] = None
+) -> None:
+    """Destroy a workspace created by trtllm_create_p2p_workspace_for_all_reduce."""
+
+    refs = _p2p_workspace_refs.pop(id(workspace), workspace)
+    for ptrs in refs:
+        free_shared_buffer(ptrs, group=group)
+
+
+def trtllm_create_p2p_workspace_for_all_reduce_fusion(
+    rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim,
+    dtype: torch.dtype = torch.float16,
+    group: Optional[ProcessGroup] = None,
+) -> Tuple[List[List[int]], torch.Tensor, int, dict]:
+    """
+    Create a CUDA IPC/P2P workspace for the newer trtllm_allreduce_fusion ABI.
+
+    This keeps the kernel launch path aligned with the multicast/symmetric-memory
+    TRT-LLM fusion path while using CUDA IPC peer mappings for platforms without
+    CUDA multicast support.
+    """
+
+    use_fp32_lamport = dtype == torch.float32
+    buffer_element_size = _dtype_nbytes(dtype)
+    lamport_dtype = torch.float32 if use_fp32_lamport else torch.float16
+    lamport_element_size = _dtype_nbytes(lamport_dtype)
+    buffer_size = tp_size * max_token_num * hidden_dim * buffer_element_size
+    flag_size = tp_size * BarrierFlagCount * 4
+    lamport_comm_size = tp_size * max_token_num * hidden_dim * lamport_element_size
+    if lamport_comm_size > MAX_COMM_SIZE:
+        logging.warning(
+            "warning: lamport_comm_size %s is greater than MAX_COMM_SIZE %s, "
+            "set to MAX_COMM_SIZE",
+            lamport_comm_size,
+            MAX_COMM_SIZE,
+        )
+        lamport_comm_size = MAX_COMM_SIZE
+    lamport_buffer_size = lamport_comm_size * 3
+
+    ipc_handles: List[List[int]] = []
+    flag_ptr: Optional[c_void_p] = None
+    try:
+        for size in [buffer_size, flag_size, lamport_buffer_size]:
+            ipc_handles.append(create_shared_buffer(round_up(size, 16), group=group))
+
+        # The twoshot barrier starts from flag value 0. cudaMalloc does not
+        # guarantee zeroed memory, so clear this rank's flag buffer before
+        # peer ranks can observe it through their IPC mappings.
+        cudart.cudaMemset(c_void_p(ipc_handles[1][rank]), 0, round_up(flag_size, 16))
+
+        trtllm_lamport_initialize(
+            ipc_handles[2][rank],
+            round_up(lamport_buffer_size, 16) // lamport_element_size,
+            lamport_dtype,
+        )
+
+        workspace = []
+        for ipc_handle in ipc_handles:
+            for peer_rank in range(tp_size):
+                workspace.append(ipc_handle[peer_rank])
+
+        flag_ptr = cudart.cudaMalloc(5 * 4)
+        cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+        lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
+        cudart.cudaMemcpy(
+            c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
+        )
+        workspace.append(flag_ptr.value)
+        workspace_tensor = torch.tensor(
+            workspace, dtype=torch.int64, device=torch.device("cuda")
+        )
+        torch.cuda.synchronize()
+    except Exception:
+        if flag_ptr is not None:
+            cudart.cudaFree(flag_ptr)
+        for ptrs in ipc_handles:
+            free_shared_buffer(ptrs, group=group)
+        raise
+
+    dist.barrier(group=group)
+    _p2p_fusion_workspace_refs[id(ipc_handles)] = ipc_handles
+
+    metadata = {
+        "tp_rank": rank,
+        "tp_size": tp_size,
+        "max_token_num": max_token_num,
+        "hidden_dim": hidden_dim,
+        "use_fp32_lamport": use_fp32_lamport,
+        "buffer_size": buffer_size,
+        "flag_size": flag_size,
+        "lamport_comm_size": lamport_comm_size,
+        "lamport_buffer_size": lamport_buffer_size,
+        "workspace_kind": "trtllm_p2p_fusion_fallback",
+    }
+    return ipc_handles, workspace_tensor, flag_ptr.value, metadata
+
+
+def trtllm_destroy_p2p_workspace_for_all_reduce_fusion(
+    workspace: List[List[int]],
+    flag_ptr: int,
+    group: Optional[ProcessGroup] = None,
+) -> None:
+    """Destroy a workspace created by trtllm_create_p2p_workspace_for_all_reduce_fusion."""
+
+    refs = _p2p_fusion_workspace_refs.pop(id(workspace), workspace)
+    for ptrs in refs:
+        free_shared_buffer(ptrs, group=group)
+    if flag_ptr:
+        cudart.cudaFree(c_void_p(flag_ptr))
 
 
 BarrierFlagCount = 256

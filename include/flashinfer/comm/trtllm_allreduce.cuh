@@ -91,6 +91,27 @@ bool is_lamport_supported(int token_num, int hidden_size) {
   return true;
 }
 
+// Keep the Lamport cluster path enabled for validated architectures through
+// SM120 while making host-side workspace layout and launch dispatch agree with
+// the device-side architecture guard below.
+inline bool is_cluster_supported() {
+  static thread_local int cached_device = -1;
+  static thread_local bool cached_result = true;
+  int device = -1;
+  FLASHINFER_CUDA_CHECK(cudaGetDevice(&device));
+  if (device != cached_device) {
+    int major = 0, minor = 0;
+    FLASHINFER_CUDA_CHECK(
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    FLASHINFER_CUDA_CHECK(
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    int const arch = major * 100 + minor * 10;
+    cached_result = arch >= 900 && arch < 1210;
+    cached_device = device;
+  }
+  return cached_result;
+}
+
 struct AllReduceFusionParams {
   AllReduceFusionParams()
       : bias_buffer(nullptr),
@@ -135,7 +156,7 @@ struct AllReduceParams {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     int flag_offset;
     if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
-        is_lamport_supported<T>(token_num, hidden_size)) {
+        is_lamport_supported<T>(token_num, hidden_size) && is_cluster_supported()) {
       flag_offset = 0;
     } else {
       flag_offset = 1;
@@ -414,7 +435,7 @@ __global__ void rms_norm_kernel(AllReduceParams<T> params) {
   local_final_output_buffer += block_offset;
   intermediate_buffer += block_offset;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -452,7 +473,7 @@ __global__ void rms_norm_kernel(AllReduceParams<T> params) {
     inter_vec = rms_norm<T, Affine, VEC_SIZE>(denom, inter_vec, weight_vec);
     inter_vec.store(&local_final_output_buffer[offset]);
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -482,7 +503,7 @@ __global__ void rms_pre_post_norm_kernel(
   local_final_output_buffer += block_offset;
   intermediate_buffer += block_offset;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -530,7 +551,7 @@ __global__ void rms_pre_post_norm_kernel(
     inter_vec = rms_norm<T, Affine, VEC_SIZE>(denom, inter_vec, weight_vec);
     inter_vec.store(&local_final_output_buffer[offset]);
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -708,7 +729,8 @@ struct Reducer<T, RanksPerNode, false> {
 template <int ClusterSize, typename T, int RanksPerNode, bool Bias = false, bool Affine = false,
           bool PushMode = true>
 __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams<T> params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+// Exclude SM12.1 and newer unvalidated architectures from cluster codegen.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   namespace cg = cooperative_groups;
   static_assert(RanksPerNode <= MAX_RANKS_PER_NODE);
   static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
@@ -892,7 +914,7 @@ __global__ void __launch_bounds__(1024, 1)
     buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -947,7 +969,7 @@ __global__ void __launch_bounds__(1024, 1)
       sum_vec.store(&local_final_output_buffer[norm_offset + offset]);
     }
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -988,7 +1010,7 @@ __global__ void __launch_bounds__(1024, 1)
     buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -1050,7 +1072,7 @@ __global__ void __launch_bounds__(1024, 1)
     sum_vec = rms_norm<T, Affine, VEC_SIZE>(denom, sum_vec, weight_vec);
     sum_vec.store(&local_final_output_buffer[norm_offset + thread_offset]);
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1067,7 +1089,7 @@ cudaError_t one_shot_all_reduce_norm_kernel_launcher(AllReduceParams<T>& params,
   }
 
   if (is_lamport_supported<T>(token_num, params.fusion_params.hidden_size) &&
-      (fusionOp != AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)) {
+      (fusionOp != AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM) && is_cluster_supported()) {
     lamport_style_one_shot_all_reduce_norm_kernel_launcher<T, RanksPerNode, Bias, Affine>(
         params, launch_with_pdl, stream);
   } else {
@@ -1204,7 +1226,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams<T> params) {
     buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -1223,6 +1245,12 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams<T> params) {
         *reinterpret_cast<int4*>(&local_shared_buffer[iter_offset]) =
             *reinterpret_cast<int4 const*>(&local_input_buffer[iter_offset]);
       }
+    }
+
+    if constexpr (PUSH_MODE) {
+      // Publish all CTA peer-buffer writes before the barrier flag is released.
+      __threadfence_system();
+      __syncthreads();
     }
 
     // wait for equivalent blocks of other GPUs to have copied data to their shareable buffer
@@ -1262,7 +1290,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams<T> params) {
     sums.store(&local_output_buffer[iter_offset]);
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1332,7 +1360,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaGridDependencySynchronize();
 #endif
 
@@ -1356,6 +1384,11 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
               *reinterpret_cast<int4 const*>(&local_input_buffer[offset_rank]);
         }
       }
+    }
+    if constexpr (PUSH_MODE) {
+      // Publish all CTA peer-buffer writes before the barrier flag is released.
+      __threadfence_system();
+      __syncthreads();
     }
     block_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank,
                   RANKS_PER_NODE, tidx, bidx, grid_size);
@@ -1400,6 +1433,12 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     }
   }
 
+  if constexpr (PUSH_MODE) {
+    // Publish partial reductions before peers pull from this rank's buffer.
+    __threadfence_system();
+    __syncthreads();
+  }
+
   block_barrier(params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank,
                 RANKS_PER_NODE, tidx, bidx, grid_size);
 
@@ -1441,7 +1480,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1210))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }

@@ -903,6 +903,29 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         pynvml.nvmlShutdown()
 
 
+def is_cuda_multicast_supported(device_idx: Optional[int] = None) -> bool:
+    """Return whether the selected CUDA device supports multicast mappings."""
+    if device_idx is None:
+        if not torch.cuda.is_available():
+            return False
+        device_idx = torch.cuda.current_device()
+    try:
+        multicast_supported = checkCudaErrors(
+            cuda.cuDeviceGetAttribute(
+                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
+                device_idx,
+            )
+        )
+        return multicast_supported != 0
+    except Exception:
+        logger.debug(
+            "Failed to query CUDA multicast support for device %s",
+            device_idx,
+            exc_info=True,
+        )
+        return False
+
+
 # TODO: This class follows similar logic with MnnvlMemory, but the latter use single instance mode to manage the memory allocation.
 class SymmDeviceMemory:
     """Python port of SymmDeviceMemory from TensorRT-LLM"""
@@ -958,14 +981,7 @@ class SymmDeviceMemory:
         self.SIGNAL_PAD_ALIGNMENT = 16
         self.SIGNAL_PAD_SIZE = SIGNAL_PAD_SIZE
 
-        # Check if device supports multicasting
-        multicast_supported = checkCudaErrors(
-            cuda.cuDeviceGetAttribute(
-                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
-                device_idx,
-            )
-        )
-        if multicast_supported == 0:
+        if not is_cuda_multicast_supported(device_idx):
             raise RuntimeError(
                 "[SymmDeviceMemory] Device does not support multicasting."
             )
